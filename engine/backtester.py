@@ -1,359 +1,275 @@
-"""
-Core backtesting engine for N-Bot Options.
-"""
+"""Core backtesting engine — pure Python, no external deps."""
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
-from datetime import datetime, date
-import struct, math, os, csv
+from typing import Optional, List
+import math
 
-# ─── SetupConfig ──────────────────────────────────────────────────────────────
 @dataclass
 class SetupConfig:
     setup_id: str
-    setup_name: str
-    entry_start_h: int; entry_start_m: int
-    entry_end_h: int; entry_end_m: int
-    hard_exit_h: int; hard_exit_m: int
-    premium_min: float; premium_max: float
-    sl_pct: float; target_pct: float
-    capital_min: int; capital_max: int
-    vix_min: int = 11
-    adx_min: Optional[float] = None
-    volume_mult: float = 1.3
-    min_body_pct: float = 0.15
-    max_gap_pct: float = 1.0
-    round_threshold: Optional[float] = None
-    ema_separation_min: Optional[float] = None
-    reversal_min: Optional[float] = None
-    entry_max_h: Optional[int] = None
-    touch_threshold: Optional[float] = None
-    touch_pct: Optional[float] = None
-    gap_min: Optional[int] = None
-    touch_min_max: Optional[str] = None  # "10_15"
-    doji_ratio_max: Optional[float] = None
-    max_trades_per_day: int = 2
-    premium_min_alt: float = 30
-    filters: dict = field(default_factory=dict)
+    entry_start_h: int; entry_end_h: int
+    entry_start_m: int = 0; entry_end_m: int = 0
+    premium_min: float = 30; premium_max: float = 150
+    sl_pct: float = 0.25; target_pct: float = 0.45
+    hard_exit_h: int = 15; hard_exit_m: int = 0
+    capital_min: float = 3000; capital_max: float = 4000
+    max_trades_per_day: int = 1
+    vix_min: int = 11; vix_max: int = 0
+    adx_min: float = 0; adx_max: float = 0
+    volume_mult: float = 0; min_body_pct: float = 0; min_body_ratio: float = 0
+    max_gap_pct: float = 0; rsi_max: float = 0; rsi_min: float = 0
+    ema_period: int = 0; ema_separation_pct: float = 0
+    doji_ratio_max: float = 0; vwap_extreme_pct: float = 0
+    nr7_lookback: int = 7; atr_mult: float = 0; expiry_skip: bool = False
 
-# ─── ChunkIndex ────────────────────────────────────────────────────────────────
 @dataclass
-class ChunkIndex:
-    dates: List[bytes]   # serialized YYYY-MM-DD for each row
-    offsets: List[int]  # byte offset in file for each row
+class TradeResult:
+    setup_id: str; setup_name: str; direction: str; strike: int
+    entry_time: str; entry_price: float; sl_price: float; target_price: float
+    exit_time: str = ''; exit_price: float = 0; pnl_pct: float = 0
+    exit_reason: str = ''; won: bool = False; capital: float = 0
 
-# ─── NiftyDataLoader ──────────────────────────────────────────────────────────
-class NiftyDataLoader:
-    def __init__(self, csv_path: str, index_path: str = None):
-        self.csv_path = csv_path
-        self.f = open(csv_path, 'rb')
-        self.size = os.path.getsize(csv_path)
-        self._chunk_idx: Optional[ChunkIndex] = None
-        self._date_map: Dict[str, List[Tuple[int, int]]] = {}  # date -> [(offset, row)]
+@dataclass
+class BacktestResult:
+    setup_id: str; setup_name: str
+    total_trades: int = 0; wins: int = 0; losses: int = 0
+    win_rate: float = 0; avg_pnl: float = 0; total_pnl: float = 0
+    max_dd: float = 0; best_trade: float = 0; worst_trade: float = 0
+    trades: List[TradeResult] = field(default_factory=list)
 
-    def _build_index(self, force: bool = False):
-        if self._chunk_idx and not force:
-            return
-        import json
-        if self._date_map:
-            return
-        print("  Building date index...")
-        f = self.f
-        f.seek(0)
-        header = f.readline()
-        pos = f.tell()
-        rows = 0
-        date_map: Dict[str, List[int]] = {}
-        while True:
-            line = f.readline()
-            if not line:
-                break
-            # date is field 0
-            first_comma = line.find(b',')
-            d = line[:first_comma].strip()
-            if d:
-                if d not in date_map:
-                    date_map[d] = []
-                date_map[d].append(pos)
-            pos = f.tell()
-            rows += 1
-        print(f"  {rows:,} rows indexed across {len(date_map)} trading dates")
-        self._date_map = date_map
-        return
+def _atm_strike(spot: float) -> int:
+    return round(spot / 50) * 50
 
-    def load_date(self, date_str: str, progress=True) -> List[dict]:
-        self._build_index()
-        if date_str not in self._date_map:
-            return []
-        offsets = self._date_map[date_str]
-        rows = []
-        f = self.f
-        for off in offsets:
-            f.seek(off)
-            row = f.readline().decode('utf-8', errors='replace').strip()
-            if not row:
-                continue
-            parts = row.split(',')
-            if len(parts) < 10:
-                continue
-            try:
-                rows.append({
-                    'timestamp': parts[0].strip(),
-                    'strike_price': float(parts[1]),
-                    'ce_close': float(parts[2]) if parts[2] not in ('', 'null', '-') else None,
-                    'ce_volume': float(parts[3]) if parts[3] not in ('', 'null', '-') else 0,
-                    'pe_close': float(parts[4]) if parts[4] not in ('', 'null', '-') else None,
-                    'pe_volume': float(parts[5]) if parts[5] not in ('', 'null', '-') else 0,
-                    'expiry': parts[6].strip() if len(parts) > 6 else '',
-                    'option_type': parts[7].strip() if len(parts) > 7 else '',
-                    'open_interest': float(parts[8]) if len(parts) > 8 and parts[8] not in ('', 'null', '-') else 0,
-                    'atm_distance': float(parts[9]) if len(parts) > 9 and parts[9] not in ('', 'null', '-') else 0,
-                })
-            except:
-                pass
-        return rows
+def _in_window(h: int, m: int, entry_start_h: int, entry_start_m: int,
+              entry_end_h: int, entry_end_m: int) -> bool:
+    total = h * 60 + m
+    start = entry_start_h * 60 + entry_start_m
+    end   = entry_end_h   * 60 + entry_end_m
+    return start <= total <= end
 
-    def all_dates(self) -> List[str]:
-        self._build_index()
-        return sorted(self._date_map.keys())
+def _is_expiry_thursday(dt) -> bool:
+    return dt.weekday() == 3
 
-    def __del__(self):
-        try:
-            self.f.close()
-        except:
-            pass
+def _estimate_option(spot: float, strike: int, direction: str, iv: float, dt: float) -> float:
+    """Simplified ATM option pricing.
+    ATM premium ≈ IV * sqrt(T) * spot * 0.4
+    ITM adds intrinsic value.
+    """
+    moneyness = abs(spot - strike) / spot
+    base = iv * math.sqrt(dt) * spot * 0.4
+    if direction == 'CE' and strike > spot:
+        base += (strike - spot)
+    elif direction == 'PE' and strike < spot:
+        base += (spot - strike)
+    return max(base, 1.0)
 
-# ─── Backtester ───────────────────────────────────────────────────────────────
+def _simulate_exit(entry_spot, entry_premium, strike, direction,
+                   nifty_df, entry_idx, hard_exit_ts, sl_pct, target_pct):
+    """Find when SL/target/hard-exit fires, return (exit_ts, exit_price, reason)."""
+    sl_price  = entry_premium * (1 - sl_pct)
+    tgt_price = entry_premium * (1 + target_pct)
+
+    future = nifty_df[nifty_df.index > entry_idx]
+    for exit_idx, exit_row in future.iterrows():
+        if exit_idx > hard_exit_ts:
+            return exit_idx, entry_spot, 'hard_exit'
+
+        exit_spot = exit_row['close']
+        delta = max(0.1, 0.5 * (1 - abs(exit_spot - strike) / strike))
+        opt_price = entry_premium * (exit_spot / entry_spot) * delta
+
+        if opt_price <= sl_price:
+            return exit_idx, opt_price, 'sl'
+        if opt_price >= tgt_price:
+            return exit_idx, opt_price, 'target'
+
+    # Hard exit fallback
+    return hard_exit_ts, entry_spot, 'hard_exit'
+
 class Backtester:
-    # Column indices in raw CSV (0-indexed):
-    COL = {'ts': 0, 'strike': 1, 'ce_close': 2, 'ce_vol': 3, 'pe_close': 4,
-           'pe_vol': 5, 'expiry': 6, 'otype': 7, 'oi': 8, 'atm_dist': 9}
+    """Iterate 1-min candles, fire setups, simulate option trades."""
 
-    def __init__(self, csv_path: str, setup: SetupConfig, capital: float = 4000):
-        self.loader = NiftyDataLoader(csv_path)
-        self.setup = setup
-        self.capital = capital
-        self.trades: List[dict] = []
-        self.wins = self.losses = self.total_pnl = 0.0
+    def __init__(self, nifty_df, vix_df, config, setup_name: str, check_fn):
+        self.nifty_df = nifty_df.copy()
+        self.vix_df    = vix_df.copy()
+        self.cfg      = config
+        self.name     = setup_name
+        self.check_fn = check_fn
+        self._prepare()
 
-    def run(self, from_date: str = None, to_date: str = None, verbose: bool = False):
-        dates = self.loader.all_dates()
-        if from_date:
-            dates = [d for d in dates if d >= from_date]
-        if to_date:
-            dates = [d for d in dates if d <= to_date]
+    def _prepare(self):
+        """Build 5-min resample and indicators."""
+        import pandas as pd
 
-        for ds in dates:
-            trades = self._simulate_day(ds)
-            for t in trades:
-                self._record_trade(t)
-                if verbose:
-                    print(f"  {ds} | {t['setup']} | {t['direction']} {t['strike']} "
-                          f"| Entry: {t['entry']:.1f} | Exit: {t['exit']:.1f} "
-                          f"| PnL: {t['pnl']:.1f} | {t['exit_reason']}")
-        return self.summary()
+        df = self.nifty_df
 
-    def _simulate_day(self, date_str: str) -> List[dict]:
-        rows = self.loader.load_date(date_str)
-        if not rows:
-            return []
+        # Ensure tz-aware
+        if hasattr(df.index, 'tz') and df.index.tz is None:
+            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        elif hasattr(df.index, 'tz') and str(df.index.tz) != 'Asia/Kolkata':
+            df = df.index.tz_convert('Asia/Kolkata')
 
-        # Separate CE and PE chains
-        ce_rows = [r for r in rows if r['option_type'] == 'CE']
-        pe_rows = [r for r in rows if r['option_type'] == 'PE']
-        if not ce_rows or not pe_rows:
-            return []
+        self.nifty_df = df
 
-        # Get unique timestamps
-        timestamps = sorted(set(r['timestamp'] for r in rows))
-        if len(timestamps) < 2:
-            return []
+        # 5-min resample
+        self.candle_5m = df[['open','high','low','close']].resample('5min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna()
 
-        # Build spot from ATM distance
-        chain_by_ts = {}
-        for ts in timestamps:
-            ts_ce = [r for r in ce_rows if r['timestamp'] == ts]
-            ts_pe = [r for r in pe_rows if r['timestamp'] == ts]
-            if ts_ce and ts_pe:
-                chain_by_ts[ts] = {'CE': ts_ce, 'PE': ts_pe}
+        # Daily
+        self.daily = df[['open','high','low','close']].resample('1d').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna()
 
-        if not chain_by_ts:
-            return []
+        # VIX 5-min
+        vix = self.vix_df.copy()
+        if hasattr(vix.index, 'tz') and vix.index.tz is None:
+            vix.index = vix.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        elif hasattr(vix.index, 'tz') and str(vix.index.tz) != 'Asia/Kolkata':
+            vix.index = vix.index.tz_convert('Asia/Kolkata')
+        self.vix_df = vix
+        self.vix_5m = vix[['close']].resample('5min').last().dropna()
 
-        # Parse entry window
-        entry_start_min = self.setup.entry_start_h * 60 + self.setup.entry_start_m
-        entry_end_min   = self.setup.entry_end_h * 60 + self.setup.entry_end_m
-        hard_exit_min   = self.setup.hard_exit_h * 60 + self.setup.hard_exit_m
-        trades = []
-        trades_today = 0
-        max_trades = getattr(self.setup, 'max_trades_per_day', 2)
+        # Indicators
+        from engine.indicators import calc_ema, calc_adx, calc_vwap, calc_rsi, calc_atr, calc_bb
 
-        for i, ts in enumerate(timestamps):
-            if ts not in chain_by_ts:
+        closes = self.candle_5m['close'].tolist()
+        highs  = self.candle_5m['high'].tolist()
+        lows   = self.candle_5m['low'].tolist()
+
+        self.ema20  = calc_ema(closes, 20)
+        self.ema5   = calc_ema(closes, 5)
+        self.adx_vals = calc_adx(highs, lows, closes, 14)['adx']
+
+        candle_tuples = [(i, r['open'], r['high'], r['low'], r['close'], 0)
+                          for i, r in self.candle_5m.iterrows()]
+        self.vwap_vals = calc_vwap(candle_tuples)
+
+        self.rsi2    = calc_rsi(closes, 2)
+        self.atr_vals = calc_atr(highs, lows, closes, 14)
+        bb_up, bb_mid, bb_lo = calc_bb(closes, 20, 2.0)
+        self.bb_upper = bb_up
+        self.bb_mid    = bb_mid
+        self.bb_lower  = bb_lo
+
+        self._closes = closes
+        self._highs  = highs
+        self._lows   = lows
+
+    def _get_indicators(self, ci: int):
+        ema20 = self.ema20[ci] if ci < len(self.ema20) else math.nan
+        ema5  = self.ema5[ci]  if ci < len(self.ema5)  else math.nan
+        adx   = self.adx_vals[ci] if ci < len(self.adx_vals) else math.nan
+        vwap  = self.vwap_vals[ci] if ci < len(self.vwap_vals) else math.nan
+        rsi2  = self.rsi2[ci] if ci < len(self.rsi2) else math.nan
+        atr   = self.atr_vals[ci] if ci < len(self.atr_vals) else math.nan
+        return ema20, ema5, adx, vwap, rsi2, atr
+
+    def _get_day_candles(self, ts):
+        day_start = ts.replace(hour=9, minute=15, second=0, microsecond=0)
+        day_end   = ts.replace(hour=15, minute=30, second=0, microsecond=0)
+        mask = (self.candle_5m.index >= day_start) & (self.candle_5m.index <= day_end)
+        day_candles = self.candle_5m[mask]
+        return [(r.name, r['open'], r['high'], r['low'], r['close'], 0)
+                for _, r in day_candles.iterrows()]
+
+    def _get_daily_candles(self, date):
+        daily_list = [(r.name, r['open'], r['high'], r['low'], r['close'], 0)
+                      for _, r in self.daily.iterrows() if r.name.date() == date]
+        return daily_list
+
+    def _get_vix(self, ts) -> float:
+        try:
+            v = self.vix_5m.loc[:ts]
+            return float(v['close'].iloc[-1]) if len(v) > 0 else 12.0
+        except Exception:
+            return 12.0
+
+    def run(self) -> BacktestResult:
+        result = BacktestResult(setup_id=self.cfg.setup_id, setup_name=self.name)
+        state  = {'_last_setup_num': self.cfg.setup_id, f's{self.cfg.setup_id}_done': False}
+
+        # Build index list once
+        idx_list = list(self.candle_5m.index)
+        n_candles = len(idx_list)
+
+        for ci in range(n_candles):
+            ts = idx_list[ci]
+            h, m = ts.hour, ts.minute
+
+            # Skip non-trading hours
+            if h < 9 or (h == 9 and m < 15) or h >= 15:
                 continue
 
-            # Parse timestamp to minutes
-            try:
-                h = int(ts.split(' ')[1].split(':')[0])
-                m = int(ts.split(' ')[1].split(':')[1])
-                cur_min = h * 60 + m
-            except:
+            if not _in_window(h, m,
+                              self.cfg.entry_start_h, self.cfg.entry_start_m,
+                              self.cfg.entry_end_h,   self.cfg.entry_end_m):
                 continue
 
-            if cur_min < entry_start_min or cur_min > entry_end_min:
-                continue
-            if trades_today >= max_trades:
-                continue
+            date = ts.date()
+            vix  = self._get_vix(ts)
+            spot = self.candle_5m['close'].iloc[ci]
+            ema20, ema5, adx, vwap, rsi2, atr = self._get_indicators(ci)
 
-            chain = chain_by_ts[ts]
-
-            # Filter by premium
-            ce_atm = self._nearest_atm(chain['CE'], 0)
-            pe_atm = self._nearest_atm(chain['PE'], 0)
-            if not ce_atm or not pe_atm:
+            # Check setup
+            if state.get(f's{self.cfg.setup_id}_done'):
                 continue
 
-            if ce_atm['ce_close'] is None or pe_atm['pe_close'] is None:
+            day_c   = self._get_day_candles(ts)
+            daily_c = self._get_daily_candles(date)
+
+            signal = self.check_fn(state, day_c, self._closes[:ci+1],
+                                   self._highs[:ci+1], self._lows[:ci+1],
+                                   spot, vix, ema20, ema5, adx, vwap, rsi2, atr,
+                                   daily_c)
+
+            if not signal or signal.get('status') != 'triggered':
                 continue
 
-            prem = ce_atm['ce_close']
-            if prem < self.setup.premium_min or prem > self.setup.premium_max:
-                prem = pe_atm['pe_close']
-                if prem < self.setup.premium_min or prem > self.setup.premium_max:
-                    continue
+            state[f's{self.cfg.setup_id}_done'] = True
 
-            # Direction from candle (uses spot estimation via ATM distance)
-            direction = 'CE' if ce_atm['atm_distance'] <= pe_atm['atm_distance'] else 'PE'
-            atm_row = ce_atm if direction == 'CE' else pe_atm
+            direction = signal['direction']
+            strike    = signal['strike']
 
-            # SL and target
-            sl = prem * (1 - self.setup.sl_pct)
-            target = prem * (1 + self.setup.target_pct)
+            # Estimate entry premium
+            iv   = vix / 100
+            premium = _estimate_option(spot, strike, direction, iv, 1.0)
+            premium = max(self.cfg.premium_min, min(self.cfg.premium_max, premium))
 
-            # Walk forward to find exit
-            exit_price = None
-            exit_reason = ''
-            exit_ts = None
-            for j in range(i + 1, len(timestamps)):
-                if timestamps[j] not in chain_by_ts:
-                    continue
-                try:
-                    tj = int(timestamps[j].split(' ')[1].split(':')[0])
-                    mj = int(timestamps[j].split(' ')[1].split(':')[1])
-                    exit_min = tj * 60 + mj
-                except:
-                    continue
+            sl_price  = premium * (1 - self.cfg.sl_pct)
+            target    = premium * (1 + self.cfg.target_pct)
 
-                subchain = chain_by_ts[timestamps[j]]
-                row = subchain['CE'] if direction == 'CE' else subchain['PE']
-                nearest = self._nearest_atm(row, 0)
-                if not nearest:
-                    continue
+            hard_exit = ts.replace(hour=self.cfg.hard_exit_h,
+                                   minute=self.cfg.hard_exit_m,
+                                   second=0, microsecond=0)
 
-                cp = nearest['ce_close'] if direction == 'CE' else nearest['pe_close']
-                if cp is None:
-                    continue
+            exit_ts, exit_price, exit_reason = _simulate_exit(
+                spot, premium, strike, direction,
+                self.nifty_df, ts, hard_exit,
+                self.cfg.sl_pct, self.cfg.target_pct
+            )
 
-                if cp <= sl:
-                    exit_price = cp
-                    exit_reason = 'SL'
-                    exit_ts = timestamps[j]
-                    break
-                elif cp >= target:
-                    exit_price = cp
-                    exit_reason = 'Target'
-                    exit_ts = timestamps[j]
-                    break
-                elif exit_min >= hard_exit_min:
-                    exit_price = cp
-                    exit_reason = 'TimeExit'
-                    exit_ts = timestamps[j]
-                    break
+            pnl_pct = (exit_price - premium) / premium * 100
+            won     = pnl_pct > 0
 
-            if exit_price is None:
-                # Use last available price at hard exit
-                last_ts = None
-                for k in range(len(timestamps) - 1, i, -1):
-                    if timestamps[k] in chain_by_ts:
-                        last_ts = timestamps[k]
-                        break
-                if last_ts:
-                    sub = chain_by_ts[last_ts]
-                    row = sub['CE'] if direction == 'CE' else sub['PE']
-                    nearest = self._nearest_atm(row, 0)
-                    if nearest:
-                        exit_price = nearest['ce_close'] if direction == 'CE' else nearest['pe_close']
-                        exit_reason = 'EndOfDay'
-                        exit_ts = last_ts
+            result.total_trades += 1
+            if won: result.wins += 1
+            else:   result.losses += 1
+            result.total_pnl += pnl_pct
+            result.best_trade  = max(result.best_trade, pnl_pct)
+            result.worst_trade = min(result.worst_trade, pnl_pct)
 
-            if exit_price:
-                pnl = exit_price - prem
-                trades.append({
-                    'date': date_str,
-                    'setup': self.setup.setup_id,
-                    'direction': direction,
-                    'strike': atm_row['strike_price'],
-                    'expiry': atm_row['expiry'],
-                    'entry': prem,
-                    'exit': exit_price,
-                    'pnl': pnl,
-                    'pnl_pct': (pnl / prem) * 100 if prem > 0 else 0,
-                    'exit_reason': exit_reason,
-                    'entry_time': ts,
-                    'exit_time': exit_ts,
-                })
-                trades_today += 1
+            result.trades.append(TradeResult(
+                setup_id=self.cfg.setup_id, setup_name=self.name,
+                direction=direction, strike=strike,
+                entry_time=str(ts), entry_price=premium,
+                sl_price=sl_price, target_price=target,
+                exit_time=str(exit_ts), exit_price=exit_price,
+                pnl_pct=pnl_pct, exit_reason=exit_reason, won=won,
+                capital=self.cfg.capital_min,
+            ))
 
-        return trades
-
-    def _nearest_atm(self, rows: List[dict], atm_dist: float) -> Optional[dict]:
-        """Find row closest to given ATM distance (0 = nearest ATM)."""
-        if not rows:
-            return None
-        return min(rows, key=lambda r: abs(r['atm_distance'] - atm_dist))
-
-    def _record_trade(self, t: dict):
-        self.trades.append(t)
-        if t['pnl'] > 0:
-            self.wins += 1
-        else:
-            self.losses += 1
-        self.total_pnl += t['pnl']
-
-    def summary(self) -> dict:
-        n = len(self.trades)
-        if n == 0:
-            return {'trades': 0, 'wins': 0, 'losses': 0, 'win_rate': 0,
-                    'avg_pnl': 0, 'total_pnl': 0, 'max_drawdown': 0,
-                    'profit_factor': 0, 'sharpe': 0}
-        wins = sum(t['pnl'] for t in self.trades if t['pnl'] > 0)
-        losses = abs(sum(t['pnl'] for t in self.trades if t['pnl'] < 0)) or 0.001
-        pnls = [t['pnl'] for t in self.trades]
-        running = []
-        cv = 0
-        for p in pnls:
-            cv += p
-            running.append(cv)
-        max_dd = 0
-        peak = 0
-        for v in running:
-            if v > peak:
-                peak = v
-            dd = peak - v
-            if dd > max_dd:
-                max_dd = dd
-        mean_pnl = sum(pnls) / n
-        std_pnl = (sum((p - mean_pnl)**2 for p in pnls) / n) ** 0.5
-        sharpe = (mean_pnl / std_pnl * (252**0.5)) if std_pnl > 0 else 0
-        return {
-            'trades': n,
-            'wins': self.wins,
-            'losses': self.losses,
-            'win_rate': self.wins / n * 100,
-            'avg_pnl': mean_pnl,
-            'total_pnl': self.total_pnl,
-            'max_drawdown': max_dd,
-            'profit_factor': wins / losses,
-            'sharpe': round(sharpe, 2),
-            '_trades': self.trades,
-        }
+        if result.total_trades > 0:
+            result.win_rate = result.wins / result.total_trades
+            result.avg_pnl  = result.total_pnl / result.total_trades
+        return result
