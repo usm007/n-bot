@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, List
 import math
+from engine.options import estimate_option_premium, simulate_exit
+
+def _estimate_option(spot: float, strike: int, direction: str, vix: float, dt_frac: float = 1.0) -> float:
+    """Wrapper — real implementation is in engine.options."""
+    from engine.options import estimate_option_premium as _fn
+    return _fn(spot, strike, direction, vix, dt_frac)
 
 @dataclass
 class SetupConfig:
@@ -37,54 +43,32 @@ class BacktestResult:
     max_dd: float = 0; best_trade: float = 0; worst_trade: float = 0
     trades: List[TradeResult] = field(default_factory=list)
 
-def _atm_strike(spot: float) -> int:
-    return round(spot / 50) * 50
+def _in_window(h: int, m: int, start_h: int, start_m: int, end_h: int, end_m: int) -> bool:
+    """True if current (h,m) is within [start, end] window."""
+    cur = h * 60 + m
+    start = start_h * 60 + start_m
+    end   = end_h   * 60 + end_m
+    return start <= cur <= end
 
-def _in_window(h: int, m: int, entry_start_h: int, entry_start_m: int,
-              entry_end_h: int, entry_end_m: int) -> bool:
-    total = h * 60 + m
-    start = entry_start_h * 60 + entry_start_m
-    end   = entry_end_h   * 60 + entry_end_m
-    return start <= total <= end
+def _atm_strike(spot: float) -> int:
+    """Nearest strike to spot, rounded to nearest 100."""
+    return round(spot / 100) * 100
 
 def _is_expiry_thursday(dt) -> bool:
     return dt.weekday() == 3
 
-def _estimate_option(spot: float, strike: int, direction: str, iv: float, dt: float) -> float:
+def estimate_option_premium(spot: float, strike: int, direction: str, vix: float, dt: float) -> float:
     """Simplified ATM option pricing.
     ATM premium ≈ IV * sqrt(T) * spot * 0.4
     ITM adds intrinsic value.
     """
     moneyness = abs(spot - strike) / spot
-    base = iv * math.sqrt(dt) * spot * 0.4
+    base = vix / 100 * math.sqrt(dt) * spot * 0.4
     if direction == 'CE' and strike > spot:
         base += (strike - spot)
     elif direction == 'PE' and strike < spot:
         base += (spot - strike)
     return max(base, 1.0)
-
-def _simulate_exit(entry_spot, entry_premium, strike, direction,
-                   nifty_df, entry_idx, hard_exit_ts, sl_pct, target_pct):
-    """Find when SL/target/hard-exit fires, return (exit_ts, exit_price, reason)."""
-    sl_price  = entry_premium * (1 - sl_pct)
-    tgt_price = entry_premium * (1 + target_pct)
-
-    future = nifty_df[nifty_df.index > entry_idx]
-    for exit_idx, exit_row in future.iterrows():
-        if exit_idx > hard_exit_ts:
-            return exit_idx, entry_spot, 'hard_exit'
-
-        exit_spot = exit_row['close']
-        delta = max(0.1, 0.5 * (1 - abs(exit_spot - strike) / strike))
-        opt_price = entry_premium * (exit_spot / entry_spot) * delta
-
-        if opt_price <= sl_price:
-            return exit_idx, opt_price, 'sl'
-        if opt_price >= tgt_price:
-            return exit_idx, opt_price, 'target'
-
-    # Hard exit fallback
-    return hard_exit_ts, entry_spot, 'hard_exit'
 
 class Backtester:
     """Iterate 1-min candles, fire setups, simulate option trades."""
@@ -187,7 +171,8 @@ class Backtester:
 
     def run(self) -> BacktestResult:
         result = BacktestResult(setup_id=self.cfg.setup_id, setup_name=self.name)
-        state  = {'_last_setup_num': self.cfg.setup_id, f's{self.cfg.setup_id}_done': False}
+        state  = {'_last_setup_num': self.cfg.setup_id}
+        prev_date = None
 
         # Build index list once
         idx_list = list(self.candle_5m.index)
@@ -201,12 +186,18 @@ class Backtester:
             if h < 9 or (h == 9 and m < 15) or h >= 15:
                 continue
 
+            date = ts.date()
+
+            # Reset per-day state when date changes
+            if date != prev_date:
+                state[f's{self.cfg.setup_id}_done'] = False
+                prev_date = date
+
             if not _in_window(h, m,
                               self.cfg.entry_start_h, self.cfg.entry_start_m,
                               self.cfg.entry_end_h,   self.cfg.entry_end_m):
                 continue
 
-            date = ts.date()
             vix  = self._get_vix(ts)
             spot = self.candle_5m['close'].iloc[ci]
             ema20, ema5, adx, vwap, rsi2, atr = self._get_indicators(ci)
@@ -231,9 +222,10 @@ class Backtester:
             direction = signal['direction']
             strike    = signal['strike']
 
-            # Estimate entry premium
+            # BS-based option pricing
             iv   = vix / 100
-            premium = _estimate_option(spot, strike, direction, iv, 1.0)
+            dt_frac = 1.0 / (6.5 * 60)  # roughly 1 minute
+            premium = estimate_option_premium(spot, strike, direction, vix, dt_frac)
             premium = max(self.cfg.premium_min, min(self.cfg.premium_max, premium))
 
             sl_price  = premium * (1 - self.cfg.sl_pct)
@@ -243,7 +235,7 @@ class Backtester:
                                    minute=self.cfg.hard_exit_m,
                                    second=0, microsecond=0)
 
-            exit_ts, exit_price, exit_reason = _simulate_exit(
+            exit_ts, exit_price, exit_reason = simulate_exit(
                 spot, premium, strike, direction,
                 self.nifty_df, ts, hard_exit,
                 self.cfg.sl_pct, self.cfg.target_pct
